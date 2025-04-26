@@ -18,7 +18,7 @@ To set up the project, follow these steps:
 
 Clone this repository:
 
-git clone https://github.com/anubhav-nekko/nexus_gstdost.git
+git clone https://github.com/soumyadeep-nekko/nexus_gstdost.git
 
 Navigate to the project directory:
 
