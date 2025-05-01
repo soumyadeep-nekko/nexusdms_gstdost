@@ -824,7 +824,7 @@ users_file = "../users.json"
 # Define a helper function to display your company logo
 def display_logo():
     # Make sure 'logo.png' is in your working directory
-    st.image("logo.png", width=200)
+    st.image("logo.png", width=150)
 
 # # Create a Bedrock Runtime client
 # bedrock_runtime = boto3.client('bedrock-runtime', region_name=REGION,
@@ -1813,273 +1813,563 @@ def query_documents_viz(selected_files, selected_page_ranges, query, top_k, web_
 
 #     return top_k_metadata, "No final step chosen by plan.", ws_response
 
-##############################
-# HELPER SUBFUNCTIONS
-##############################
+# ##############################
+# # HELPER SUBFUNCTIONS
+# ##############################
 
-def simple_retrieval_agent(user_query, files, file_page_ranges, topk, metadata_store, faiss_index):
-    """
-    1) Embed user_query directly (no JSON refinement).
-    2) Search FAISS for topk matches.
-    3) Filter by the selected files & page ranges.
-    4) Return the doc chunks as top_k_metadata, plus error string if needed.
-    """
-    if faiss_index.ntotal == 0:
-        return [], "FAISS index is empty."
+# def simple_retrieval_agent(user_query, files, file_page_ranges, topk, metadata_store, faiss_index):
+#     """
+#     1) Embed user_query directly (no JSON refinement).
+#     2) Search FAISS for topk matches.
+#     3) Filter by the selected files & page ranges.
+#     4) Return the doc chunks as top_k_metadata, plus error string if needed.
+#     """
+#     if faiss_index.ntotal == 0:
+#         return [], "FAISS index is empty."
 
-    emb = generate_titan_embeddings(user_query)
-    if emb is None:
-        return [], "Error generating embeddings."
+#     emb = generate_titan_embeddings(user_query)
+#     if emb is None:
+#         return [], "Error generating embeddings."
 
-    emb = emb.reshape(1, -1)
-    k = faiss_index.ntotal
-    distances, indices = faiss_index.search(emb, k)
+#     emb = emb.reshape(1, -1)
+#     k = faiss_index.ntotal
+#     distances, indices = faiss_index.search(emb, k)
 
-    filtered_results = []
-    for dist, idx in zip(distances[0], indices[0]):
-        if idx < len(metadata_store):
-            meta = metadata_store[idx]
-            if meta["filename"] in files:
-                (pg_min, pg_max) = file_page_ranges.get(meta["filename"], (None, None))
-                if pg_min is not None and pg_max is not None and (pg_min <= meta["page"] <= pg_max):
-                    filtered_results.append((dist, idx))
+#     filtered_results = []
+#     for dist, idx in zip(distances[0], indices[0]):
+#         if idx < len(metadata_store):
+#             meta = metadata_store[idx]
+#             if meta["filename"] in files:
+#                 (pg_min, pg_max) = file_page_ranges.get(meta["filename"], (None, None))
+#                 if pg_min is not None and pg_max is not None and (pg_min <= meta["page"] <= pg_max):
+#                     filtered_results.append((dist, idx))
 
-    # keep topk
-    results_sorted = sorted(filtered_results, key=lambda x: x[0])[:topk]
-    top_k_md = [metadata_store[r[1]] for r in results_sorted]
-    return top_k_md, None
-
-
-def analysis_agent_chunked(doc_context, ws_data, eco_mode):
-    """
-    Splits doc_context into smaller groups (e.g. 3 at a time).
-    Calls LLM for each group => multi-paragraph analysis => combines.
-    """
-    if not doc_context:
-        return [{"analysis_summary": "No doc context found."}]
-
-    chunk_size = 3
-    chunked = [doc_context[i:i+chunk_size] for i in range(0, len(doc_context), chunk_size)]
-    final_sections = []
-
-    sys_msg = (
-        "You are a 'deep research' agent. For each chunk group, produce a thorough, multi-paragraph analysis. "
-        "Combine them into one final multi-section Markdown. Cite important details from the chunk text."
-    )
-    ws_str = f"\nWEB SEARCH:\n{ws_data}" if ws_data else ""
-
-    for i, group in enumerate(chunked, start=1):
-        group_text = "\n".join([f"Page {ch['page']}: {ch['text']}" for ch in group])
-        user_prompt = f"### Section {i} Analysis\nDOC CONTEXT:\n{group_text}{ws_str}\n\nProvide a detailed analysis."
-        if eco_mode:
-            section_result = call_novalite_api(sys_msg, user_prompt)
-        else:
-            section_result = call_llm_api(sys_msg, user_prompt)
-        final_sections.append(section_result)
-
-    combined_markdown = "\n\n".join(final_sections)
-    return [{"analysis_summary": combined_markdown}]
+#     # keep topk
+#     results_sorted = sorted(filtered_results, key=lambda x: x[0])[:topk]
+#     top_k_md = [metadata_store[r[1]] for r in results_sorted]
+#     return top_k_md, None
 
 
-def drafting_agent_multi(user_query, doc_context, conv_history, ws_data, eco_mode):
-    """
-    1) Generate an outline (JSON: title + sections).
-    2) For each heading, call LLM => get an intro.
-    3) For each subpoint, call LLM => expansion.
-    4) Combine into a final multi-page Markdown.
-    5) We keep calls minimal but chunked to avoid large single prompts.
-    """
+# def analysis_agent_chunked(doc_context, ws_data, eco_mode):
+#     """
+#     Splits doc_context into smaller groups (e.g. 3 at a time).
+#     Calls LLM for each group => multi-paragraph analysis => combines.
+#     """
+#     if not doc_context:
+#         return [{"analysis_summary": "No doc context found."}]
 
-    import json
+#     chunk_size = 3
+#     chunked = [doc_context[i:i+chunk_size] for i in range(0, len(doc_context), chunk_size)]
+#     final_sections = []
 
-    # Step 1: Outline
-    sys_outline = (
-        "You are a drafting agent. Return a JSON outline (keys: 'title' and 'sections'), no extra text. "
-        "Sections is a list of objects, each with 'heading' and 'subpoints'."
-    )
-    doc_text = "\n".join([f"Page {ch['page']}: {ch['text']}" for ch in doc_context if 'page' in ch])
-    conv_str = "\n".join([f"{m['role'].upper()} says: {m['content']}" for m in conv_history])
-    ws_str = f"WEB SEARCH: {ws_data}" if ws_data else ""
+#     sys_msg = (
+#         "You are a 'deep research' agent. For each chunk group, produce a thorough, multi-paragraph analysis. "
+#         "Combine them into one final multi-section Markdown. Cite important details from the chunk text."
+#     )
+#     ws_str = f"\nWEB SEARCH:\n{ws_data}" if ws_data else ""
 
-    outline_prompt = f"""
-    USER QUERY:
-    {user_query}
+#     for i, group in enumerate(chunked, start=1):
+#         group_text = "\n".join([f"Page {ch['page']}: {ch['text']}" for ch in group])
+#         user_prompt = f"### Section {i} Analysis\nDOC CONTEXT:\n{group_text}{ws_str}\n\nProvide a detailed analysis."
+#         if eco_mode:
+#             section_result = call_novalite_api(sys_msg, user_prompt)
+#         else:
+#             section_result = call_llm_api(sys_msg, user_prompt)
+#         final_sections.append(section_result)
 
-    DOCUMENT CONTEXT:
-    {doc_text}
-
-    CONVERSATION:
-    {conv_str}
-
-    {ws_str}
-
-    Return valid JSON outline with 'title' and 'sections'.
-    """
-
-    if eco_mode:
-        outline_json_str = call_novalite_api(sys_outline, outline_prompt)
-    else:
-        outline_json_str = call_llm_api(sys_outline, outline_prompt)
-
-    try:
-        parsed_outline = json.loads(outline_json_str.strip())
-    except:
-        parsed_outline = {
-            "title": "Draft Document",
-            "sections": [
-                {"heading": "Outline Error", "subpoints": ["Unable to parse JSON outline."]}
-            ]
-        }
-
-    # Step 2: Expand each heading + subpoint in smaller calls
-    sys_expand = (
-        "You are a drafting agent. Expand headings & subpoints in multi-paragraph Markdown. "
-        "Focus on clarity and structure. No JSON in final output."
-    )
-    final_sections = []
-    doc_title = parsed_outline.get("title", "Draft Document")
-    sections = parsed_outline.get("sections", [])
-
-    for i, sec in enumerate(sections, start=1):
-        heading_name = sec.get("heading", f"Heading {i}")
-        subpoints = sec.get("subpoints", [])
-
-        # Heading intro
-        heading_prompt = f"HEADING: {heading_name}\nProvide an introductory overview in Markdown."
-        if eco_mode:
-            heading_intro = call_novalite_api(sys_expand, heading_prompt)
-        else:
-            heading_intro = call_llm_api(sys_expand, heading_prompt)
-
-        heading_block = [f"## {heading_name}\n\n{heading_intro}\n"]
-
-        # Expand each subpoint
-        for j, sp_text in enumerate(subpoints, start=1):
-            sp_prompt = f"HEADING: {heading_name}\nSUBPOINT: {sp_text}\nExpand in multi-paragraph Markdown."
-            if eco_mode:
-                sp_expanded = call_novalite_api(sys_expand, sp_prompt)
-            else:
-                sp_expanded = call_llm_api(sys_expand, sp_prompt)
-
-            heading_block.append(f"**{j}.** {sp_text}\n\n{sp_expanded}\n")
-
-        final_sections.append("\n".join(heading_block))
-
-    final_doc = f"# {doc_title}\n\n" + "\n\n".join(final_sections)
-    return final_doc
+#     combined_markdown = "\n\n".join(final_sections)
+#     return [{"analysis_summary": combined_markdown}]
 
 
-def qna_agent_simple(user_query, doc_context, original_doc_context, conv_history, ws_data, chosen_model):
-    """
-    Single-pass Q&A. If doc_context was replaced by analysis_summary, revert to original doc chunks for 'page' references.
-    """
-    # Check if doc_context is an analysis summary
-    if len(doc_context) == 1 and "analysis_summary" in doc_context[0]:
-        # revert to original doc context for page references
-        use_context = original_doc_context
-    else:
-        use_context = doc_context
+# def drafting_agent_multi(user_query, doc_context, conv_history, ws_data, eco_mode):
+#     """
+#     1) Generate an outline (JSON: title + sections).
+#     2) For each heading, call LLM => get an intro.
+#     3) For each subpoint, call LLM => expansion.
+#     4) Combine into a final multi-page Markdown.
+#     5) We keep calls minimal but chunked to avoid large single prompts.
+#     """
 
-    doc_text = "\n".join([f"Page {ch['page']}: {ch['text']}" for ch in use_context if 'page' in ch])
-    conv_text = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in conv_history])
-    ws_str = f"WEB SEARCH: {ws_data}" if ws_data else ""
+#     import json
 
-    combined_input = f"""
-    USER QUERY: {user_query}
-    DOC CONTEXT:
-    {doc_text}
+#     # Step 1: Outline
+#     sys_outline = (
+#         "You are a drafting agent. Return a JSON outline (keys: 'title' and 'sections'), no extra text. "
+#         "Sections is a list of objects, each with 'heading' and 'subpoints'."
+#     )
+#     doc_text = "\n".join([f"Page {ch['page']}: {ch['text']}" for ch in doc_context if 'page' in ch])
+#     conv_str = "\n".join([f"{m['role'].upper()} says: {m['content']}" for m in conv_history])
+#     ws_str = f"WEB SEARCH: {ws_data}" if ws_data else ""
 
-    CONVERSATION:
-    {conv_text}
+#     outline_prompt = f"""
+#     USER QUERY:
+#     {user_query}
 
-    {ws_str}
-    """
+#     DOCUMENT CONTEXT:
+#     {doc_text}
 
-    # pick model
-    if chosen_model == "Claude 3.5 Sonnet":
-        return call_llm_api(system_message, combined_input)
-    elif chosen_model == "Claude 3.7 Sonnet":
-        return call_claude_api(system_message, combined_input)
-    elif chosen_model == "Nova Lite":
-        return call_novalite_api(system_message, combined_input)
-    elif chosen_model == "Deepseek R1":
-        return call_deepseek_api(system_message, combined_input)
-    elif chosen_model == "GPT 4o":
-        return call_gpt_api(system_message, combined_input)
-    else:
-        return call_llm_api(system_message, combined_input)
+#     CONVERSATION:
+#     {conv_str}
+
+#     {ws_str}
+
+#     Return valid JSON outline with 'title' and 'sections'.
+#     """
+
+#     if eco_mode:
+#         outline_json_str = call_novalite_api(sys_outline, outline_prompt)
+#     else:
+#         outline_json_str = call_llm_api(sys_outline, outline_prompt)
+
+#     try:
+#         parsed_outline = json.loads(outline_json_str.strip())
+#     except:
+#         parsed_outline = {
+#             "title": "Draft Document",
+#             "sections": [
+#                 {"heading": "Outline Error", "subpoints": ["Unable to parse JSON outline."]}
+#             ]
+#         }
+
+#     # Step 2: Expand each heading + subpoint in smaller calls
+#     sys_expand = (
+#         "You are a drafting agent. Expand headings & subpoints in multi-paragraph Markdown. "
+#         "Focus on clarity and structure. No JSON in final output."
+#     )
+#     final_sections = []
+#     doc_title = parsed_outline.get("title", "Draft Document")
+#     sections = parsed_outline.get("sections", [])
+
+#     for i, sec in enumerate(sections, start=1):
+#         heading_name = sec.get("heading", f"Heading {i}")
+#         subpoints = sec.get("subpoints", [])
+
+#         # Heading intro
+#         heading_prompt = f"HEADING: {heading_name}\nProvide an introductory overview in Markdown."
+#         if eco_mode:
+#             heading_intro = call_novalite_api(sys_expand, heading_prompt)
+#         else:
+#             heading_intro = call_llm_api(sys_expand, heading_prompt)
+
+#         heading_block = [f"## {heading_name}\n\n{heading_intro}\n"]
+
+#         # Expand each subpoint
+#         for j, sp_text in enumerate(subpoints, start=1):
+#             sp_prompt = f"HEADING: {heading_name}\nSUBPOINT: {sp_text}\nExpand in multi-paragraph Markdown."
+#             if eco_mode:
+#                 sp_expanded = call_novalite_api(sys_expand, sp_prompt)
+#             else:
+#                 sp_expanded = call_llm_api(sys_expand, sp_prompt)
+
+#             heading_block.append(f"**{j}.** {sp_text}\n\n{sp_expanded}\n")
+
+#         final_sections.append("\n".join(heading_block))
+
+#     final_doc = f"# {doc_title}\n\n" + "\n\n".join(final_sections)
+#     return final_doc
 
 
-##############################
-# MAIN FUNCTION
-##############################
+# def qna_agent_simple(user_query, doc_context, original_doc_context, conv_history, ws_data, chosen_model):
+#     """
+#     Single-pass Q&A. If doc_context was replaced by analysis_summary, revert to original doc chunks for 'page' references.
+#     """
+#     # Check if doc_context is an analysis summary
+#     if len(doc_context) == 1 and "analysis_summary" in doc_context[0]:
+#         # revert to original doc context for page references
+#         use_context = original_doc_context
+#     else:
+#         use_context = doc_context
+
+#     doc_text = "\n".join([f"Page {ch['page']}: {ch['text']}" for ch in use_context if 'page' in ch])
+#     conv_text = "\n".join([f"{m['role'].upper()}: {m['content']}" for m in conv_history])
+#     ws_str = f"WEB SEARCH: {ws_data}" if ws_data else ""
+
+#     combined_input = f"""
+#     USER QUERY: {user_query}
+#     DOC CONTEXT:
+#     {doc_text}
+
+#     CONVERSATION:
+#     {conv_text}
+
+#     {ws_str}
+#     """
+
+#     # pick model
+#     if chosen_model == "Claude 3.5 Sonnet":
+#         return call_llm_api(system_message, combined_input)
+#     elif chosen_model == "Claude 3.7 Sonnet":
+#         return call_claude_api(system_message, combined_input)
+#     elif chosen_model == "Nova Lite":
+#         return call_novalite_api(system_message, combined_input)
+#     elif chosen_model == "Deepseek R1":
+#         return call_deepseek_api(system_message, combined_input)
+#     elif chosen_model == "GPT 4o":
+#         return call_gpt_api(system_message, combined_input)
+#     else:
+#         return call_llm_api(system_message, combined_input)
+
+
+# ##############################
+# # MAIN FUNCTION
+# ##############################
+
+# def query_documents_with_page_range(
+#     selected_files,
+#     selected_page_ranges,
+#     prompt,
+#     top_k,
+#     last_messages,
+#     web_search,
+#     llm_model,
+#     draft_mode,
+#     analyse_mode,
+#     eco_mode
+# ):
+#     """
+#     1) Retrieve doc chunks
+#     2) Keep a copy (original_doc_context) to preserve page references
+#     3) If analysis => doc_context replaced by analysis_summary
+#     4) If drafting => produce multi-section doc
+#     5) Else => Q&A uses original context if analysis replaced it
+#     """
+
+#     # (A) Prompt Chunking if needed
+#     if len(prompt.split()) > 3000:  # or 4000, adjust as needed
+#         short_sys = "You are a summarization agent. Summarize the user prompt in 300 words or fewer."
+#         if eco_mode:
+#             prompt = call_novalite_api(short_sys, prompt)
+#         else:
+#             prompt = call_llm_api(short_sys, prompt)
+
+#     # (B) Always do Retrieval first
+#     doc_context, retrieval_err = simple_retrieval_agent(prompt, selected_files, selected_page_ranges, top_k, metadata_store, faiss_index)
+#     if retrieval_err:
+#         # On error, return empty doc context + error message
+#         return [], retrieval_err, ""
+
+#     # Keep a copy of the original doc context for Q&A references
+#     original_doc_context = doc_context[:]
+
+#     # (C) Optional web search
+#     ws_data = ""
+#     if web_search:
+#         # Simple approach: call TavilyClient with the raw prompt
+#         client = TavilyClient(api_key=TAVILY_API)
+#         ws_data = client.search(query=prompt, search_depth="basic", include_raw_content=False)
+
+#     # Build a simple "plan"
+#     tasks = []
+#     tasks.append("analysis" if analyse_mode else None)
+#     tasks.append("drafting" if draft_mode else None)
+#     tasks = [t for t in tasks if t]  # remove None
+#     if not tasks:
+#         tasks = ["qna"]  # default Q&A if no analysis/drafting
+
+#     # (D) If "analysis" => chunk-based deep research
+#     if "analysis" in tasks:
+#         doc_context = analysis_agent_chunked(doc_context, ws_data, eco_mode)
+#         # doc_context is now: [ { "analysis_summary": "...multi-section text..." } ]
+
+#     # (E) If "drafting" => multi-step outline => expansions
+#     if "drafting" in tasks:
+#         final_doc = drafting_agent_multi(prompt, doc_context, last_messages, ws_data, eco_mode)
+#         # We return an empty doc context, the final drafted doc, and the web results
+#         return [], final_doc, ws_data
+
+#     # (F) Otherwise => Q&A
+#     final_answer = qna_agent_simple(prompt, doc_context, original_doc_context, last_messages, ws_data, llm_model)
+#     return doc_context, final_answer, ws_data
 
 def query_documents_with_page_range(
-    selected_files,
-    selected_page_ranges,
-    prompt,
-    top_k,
-    last_messages,
-    web_search,
-    llm_model,
-    draft_mode,
-    analyse_mode,
-    eco_mode
+    selected_files: list,
+    selected_page_ranges: dict,
+    prompt: str,
+    top_k: int,
+    last_messages: list,
+    web_search: bool,
+    llm_model: str,
+    draft_mode: bool,
+    analyse_mode: bool,
+    eco_mode: bool
 ):
     """
-    1) Retrieve doc chunks
-    2) Keep a copy (original_doc_context) to preserve page references
-    3) If analysis => doc_context replaced by analysis_summary
-    4) If drafting => produce multi-section doc
-    5) Else => Q&A uses original context if analysis replaced it
+    Orchestrates a multi-step Deep Research workflow:
+      1. Retrieve relevant doc chunks (FAISS).
+      2. (Optional) Perform a web search.
+      3. (Optional) Chunk-based deep analysis or direct minimal pass.
+      4. If draft_mode=True => produce a structured draft.
+         Else => produce a final Q&A style answer.
+    
+    Returns:
+        (doc_chunks, final_text, ws_data)
+        Where:
+          - doc_chunks: the top-K relevant chunks from the documents
+          - final_text: either a final Q&A answer OR a drafted doc (depending on draft_mode)
+          - ws_data: web search results dict (if any)
     """
 
-    # (A) Prompt Chunking if needed
-    if len(prompt.split()) > 3000:  # or 4000, adjust as needed
-        short_sys = "You are a summarization agent. Summarize the user prompt in 300 words or fewer."
+    #############################################################################
+    # 1) Helper: Retrieve relevant doc chunks from FAISS
+    #############################################################################
+    def retrieve_relevant_chunks(
+        user_query: str,
+        files: list,
+        page_ranges: dict,
+        topk: int
+    ) -> list:
+        """
+        1) Embed the user query.
+        2) Search FAISS for top-k results.
+        3) Filter by selected files & page ranges.
+        4) Return a list of chunk metadata (doc excerpt, filename, page, etc.).
+        """
+
+        # Make sure your FAISS index and metadata_store are accessible, e.g.:
+        # global faiss_index, metadata_store
+        # Or reference them from st.session_state if you store them there.
+        # <Your Existing Code> for faiss_index, metadata_store, etc.
+        global faiss_index, metadata_store
+
+        if faiss_index.ntotal == 0:
+            return []
+
+        # 1) Embed the query
+        query_emb = generate_titan_embeddings(user_query)  # <Your Existing Code>
+        if query_emb is None:
+            return []
+
+        query_emb = query_emb.reshape(1, -1)
+
+        # 2) Search entire index
+        total_docs = faiss_index.ntotal
+        distances, indices = faiss_index.search(query_emb, total_docs)
+
+        # 3) Filter by file + page range
+        filtered = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx < len(metadata_store):
+                meta = metadata_store[idx]
+                if meta["filename"] in files:
+                    (pg_min, pg_max) = page_ranges.get(meta["filename"], (None, None))
+                    if pg_min is not None and pg_max is not None:
+                        if pg_min <= meta["page"] <= pg_max:
+                            filtered.append((dist, idx))
+
+        # 4) Keep top_k best matches
+        filtered_sorted = sorted(filtered, key=lambda x: x[0])[:topk]
+        top_k_chunks = [metadata_store[x[1]] for x in filtered_sorted]
+
+        return top_k_chunks
+
+    #############################################################################
+    # 2) Helper: Perform Web Search (optional)
+    #############################################################################
+    def perform_web_search(user_query: str) -> dict:
+        """
+        Calls TavilyClient (or any external web search) with the user query.
+        Return raw web results as a dict. You may also refine the query first if needed.
+        """
+        if not web_search:
+            return {}
+        
+        # <Your Existing Code> e.g.:
+        # client = TavilyClient(api_key=TAVILY_API)
+        # results = client.search(query=user_query, search_depth="advanced", include_raw_content=True)
+        # return results
+
+        # For now, just a placeholder:
+        return {
+            "message": f"Web search simulated for query: {user_query}",
+            "results": []
+        }
+
+    #############################################################################
+    # 3) Helper: Chunk-Based Analysis
+    #############################################################################
+    def analysis_agent_chunked(doc_chunks: list, ws_data: dict) -> dict:
+        """
+        Summarize doc_chunks in smaller groups (3 at a time). Optionally incorporate ws_data.
+        Return a dict with 'analysis_summary' and 'references'.
+        """
+        if not doc_chunks:
+            return {"analysis_summary": "No doc context found.", "references": []}
+        
+        chunk_size = 3
+        grouped = [doc_chunks[i:i+chunk_size] for i in range(0, len(doc_chunks), chunk_size)]
+        
+        final_sections = []
+        references = []
+
+        # System message to produce thorough analysis
+        sys_msg = (
+            "You are a deep-research analysis agent. For each chunk group, produce a thorough, "
+            "multi-paragraph analysis referencing the filename/page. Then combine them all. "
+            "Include web info if provided."
+        )
+        # Convert ws_data to text if needed
+        ws_str = f"\nWEB SEARCH:\n{json.dumps(ws_data)}" if ws_data else ""
+
+        for i, group in enumerate(grouped, start=1):
+            group_text = "\n".join(
+                f"File: {chunk['filename']}, Page: {chunk['page']} => {chunk['text']}"
+                for chunk in group
+            )
+            user_prompt = f"### Section {i} Analysis\nDOC EXCERPTS:\n{group_text}{ws_str}\n\n"
+            user_prompt += "Provide a detailed analysis with references to each file/page."
+
+            # Decide which LLM call
+            if eco_mode:
+                section_result = call_novalite_api(sys_msg, user_prompt)  # <Your Existing Code>
+            else:
+                section_result = call_llm_api(sys_msg, user_prompt)        # <Your Existing Code>
+            
+            final_sections.append(section_result)
+            references.append({"section": i, "chunks": group})
+
+        combined_summary = "\n\n".join(final_sections)
+        return {
+            "analysis_summary": combined_summary,
+            "references": references
+        }
+
+    #############################################################################
+    # 4) Helper: Cross-reference agent (optional)
+    #############################################################################
+    def cross_reference_agent(analysis_output: dict, ws_data: dict) -> dict:
+        """
+        If you want an additional pass that cross-checks doc analysis with web data again, do it here.
+        Or skip if your analysis_agent_chunked already merges everything.
+        """
+        analysis_text = analysis_output.get("analysis_summary", "")
+        refs = analysis_output.get("references", [])
+
+        if not analysis_text:
+            return analysis_output  # nothing to do
+
+        sys_msg = (
+            "You are a synthesis agent. You have an analysis summary from documents plus raw web data. "
+            "Cross-check them for any corroborating or conflicting info. Cite chunk references and any web references."
+        )
+        input_text = f"ANALYSIS SUMMARY:\n{analysis_text}\n\nWEB DATA:\n{json.dumps(ws_data)}"
+
         if eco_mode:
-            prompt = call_novalite_api(short_sys, prompt)
+            synthesis_result = call_novalite_api(sys_msg, input_text)
         else:
-            prompt = call_llm_api(short_sys, prompt)
+            synthesis_result = call_llm_api(sys_msg, input_text)
+        
+        return {
+            "synthesis_summary": synthesis_result,
+            "references": refs
+        }
 
-    # (B) Always do Retrieval first
-    doc_context, retrieval_err = simple_retrieval_agent(prompt, selected_files, selected_page_ranges, top_k, metadata_store, faiss_index)
-    if retrieval_err:
-        # On error, return empty doc context + error message
-        return [], retrieval_err, ""
+    #############################################################################
+    # 5) Helper: Drafting Agent (if draft_mode=True)
+    #############################################################################
+    def drafting_agent_multi(
+        user_query: str,
+        doc_synthesis: dict,
+        last_msgs: list,
+        ws_data: dict
+    ) -> str:
+        """
+        Generate a structured final doc with headings, subpoints, references, etc.
+        """
+        analysis_text = doc_synthesis.get("synthesis_summary") or doc_synthesis.get("analysis_summary", "")
+        sys_msg = (
+            "You are a drafting agent. Create a structured document from the analysis text. "
+            "Include headings, bullet points, references, and a coherent flow. "
+            "Use the user query, doc references, and web data if relevant."
+        )
 
-    # Keep a copy of the original doc context for Q&A references
-    original_doc_context = doc_context[:]
+        combined_context = f"""
+        USER QUERY: {user_query}
+        ANALYSIS TEXT: {analysis_text}
+        WEB DATA: {json.dumps(ws_data)}
+        LAST MESSAGES: {json.dumps(last_msgs)}
+        """
 
-    # (C) Optional web search
-    ws_data = ""
-    if web_search:
-        # Simple approach: call TavilyClient with the raw prompt
-        client = TavilyClient(api_key=TAVILY_API)
-        ws_data = client.search(query=prompt, search_depth="basic", include_raw_content=False)
+        if eco_mode:
+            final_doc = call_novalite_api(sys_msg, combined_context)
+        else:
+            final_doc = call_llm_api(sys_msg, combined_context)
 
-    # Build a simple "plan"
-    tasks = []
-    tasks.append("analysis" if analyse_mode else None)
-    tasks.append("drafting" if draft_mode else None)
-    tasks = [t for t in tasks if t]  # remove None
-    if not tasks:
-        tasks = ["qna"]  # default Q&A if no analysis/drafting
+        return final_doc
 
-    # (D) If "analysis" => chunk-based deep research
-    if "analysis" in tasks:
-        doc_context = analysis_agent_chunked(doc_context, ws_data, eco_mode)
-        # doc_context is now: [ { "analysis_summary": "...multi-section text..." } ]
+    #############################################################################
+    # 6) Helper: Simple Q&A Agent (if draft_mode=False)
+    #############################################################################
+    def qna_agent_simple(
+        user_query: str,
+        doc_synthesis: dict,
+        last_msgs: list,
+        ws_data: dict,
+        model_name: str
+    ) -> str:
+        analysis_text = (
+            doc_synthesis.get("synthesis_summary") or doc_synthesis.get("analysis_summary", "")
+        )
+        sys_msg = (
+            "You are a Q&A agent. Use the analysis text and web data to answer the user's query. "
+            "Provide thorough references to chunk pages or web results."
+        )
+        combined_context = f"""
+        USER QUERY: {user_query}
+        ANALYSIS TEXT: {analysis_text}
+        WEB DATA: {json.dumps(ws_data)}
+        LAST MESSAGES: {json.dumps(last_msgs)}
+        """
 
-    # (E) If "drafting" => multi-step outline => expansions
-    if "drafting" in tasks:
-        final_doc = drafting_agent_multi(prompt, doc_context, last_messages, ws_data, eco_mode)
-        # We return an empty doc context, the final drafted doc, and the web results
-        return [], final_doc, ws_data
+        if model_name == "Claude 3.5 Sonnet":
+            answer = call_llm_api(sys_msg, combined_context)
+        elif model_name == "Claude 3.7 Sonnet":
+            answer = call_claude_api(sys_msg, combined_context)  # <Your Existing Code if you have it>
+        elif model_name == "Nova Lite":
+            answer = call_novalite_api(sys_msg, combined_context)
+        elif model_name == "Deepseek R1":
+            answer = call_deepseek_api(sys_msg, combined_context)
+        elif model_name == "GPT 4o":
+            answer = call_gpt_api(sys_msg, combined_context)
+        else:
+            # Fallback
+            answer = call_llm_api(sys_msg, combined_context)
+        
+        return answer
 
-    # (F) Otherwise => Q&A
-    final_answer = qna_agent_simple(prompt, doc_context, original_doc_context, last_messages, ws_data, llm_model)
-    return doc_context, final_answer, ws_data
+    #############################################################################
+    # MAIN ORCHESTRATION
+    #############################################################################
+    # STEP A: Retrieve doc chunks
+    doc_chunks = retrieve_relevant_chunks(prompt, selected_files, selected_page_ranges, top_k)
+
+    if not doc_chunks:
+        return [], "No relevant documents found or FAISS index is empty.", {}
+
+    # STEP B: Perform web search if enabled
+    ws_data = perform_web_search(prompt) if web_search else {}
+
+    # STEP C: If analyse_mode => do chunk-based deep analysis
+    if analyse_mode:
+        analysis_output = analysis_agent_chunked(doc_chunks, ws_data)
+        # Optional cross-reference step
+        doc_synthesis = cross_reference_agent(analysis_output, ws_data)
+    else:
+        # minimal pass, just combine chunk text
+        combined_text = "\n".join(ch["text"] for ch in doc_chunks)
+        doc_synthesis = {
+            "synthesis_summary": combined_text,
+            "references": doc_chunks
+        }
+
+    # STEP D: If draft_mode => produce final doc
+    if draft_mode:
+        final_doc = drafting_agent_multi(prompt, doc_synthesis, last_messages, ws_data)
+        return doc_chunks, final_doc, ws_data
+    else:
+        # Otherwise => Q&A
+        final_answer = qna_agent_simple(prompt, doc_synthesis, last_messages, ws_data, llm_model)
+        return doc_chunks, final_answer, ws_data
+
 
 
 def final_format(top_k_metadata, answer, ws_response):
@@ -2789,16 +3079,14 @@ def main():
 
         # "New Chat" button resets conversation and state.
         if st.sidebar.button("New Chat"):
-            st.session_state.current_conversation_id = None  
+            st.session_state.current_conversation_id = None  # Clear any old conversation ID
             st.session_state.current_conversation = None
             st.session_state.messages = []
             st.session_state.sources = []
             # Clear previous file/page selections too.
             st.session_state.selected_files = []
             st.session_state.selected_page_ranges = {}
-            st.session_state.original_conversation_id = None  
             st.success("Started a new conversation.")
-        
         eco_mode = st.sidebar.toggle("Eco Mode", value=True)
         web_search = st.sidebar.toggle("Enable Web Search")
         draft_mode = st.sidebar.toggle("Enable Draft Mode (To Generate Documents/ Arguments)")
@@ -2806,14 +3094,18 @@ def main():
         top_k = st.sidebar.slider("Select Top-K Results", min_value=1, max_value=100, value=50, step=1)
 
         # File and Page Range Selection
+        # available_files = list(set([metadata['filename'] for metadata in metadata_store]))
         current_user = st.session_state.get("username", "unknown")
+        # Only include files where the owner is the current user or shared with the user.
         available_files = list({
             md["filename"] 
             for md in metadata_store 
             if md.get("owner") == current_user or current_user in md.get("shared_with", [])
         })
 
+
         if available_files:
+            # Use multiselect and store the selection in session state.
             st.session_state.selected_files = st.multiselect(
                 "Select files to include in the query:",
                 available_files,
@@ -2821,9 +3113,11 @@ def main():
             )
             if len(st.session_state.selected_files) > 4:
                 st.warning("For best results, select a maximum of 4 files.")
+                # return
 
             page_ranges = get_page_range_for_files(st.session_state.selected_files)
             selected_page_ranges = {}
+            # For each file, show page range inputs and store values in session state.
             for file in st.session_state.selected_files:
                 min_page, max_page = page_ranges[file]
                 col1, col2 = st.sidebar.columns(2)
@@ -2846,32 +3140,46 @@ def main():
                 selected_page_ranges[file] = (start_page, end_page)
             st.session_state.selected_page_ranges = selected_page_ranges
 
+
         summaries = {}
+        # selected_files = []
+        # At the top of the "Query Advanced" option, display document summaries.
         if st.session_state.selected_files and st.button("Nekko Insignts"):
             st.subheader("Document Summaries")
+            # Create columns (one per selected file)
+            # cols = st.columns(len(selected_files))
             for idx, file in enumerate(st.session_state.selected_files):
+                # Get the page range for the file.
                 min_page, max_page = selected_page_ranges.get(file, (None, None))
                 if min_page is not None and max_page is not None:
+                    # Use the summary prompt as the system message (you may have a variable 'summary_prompt' already defined).
                     summary = summarize_document_pages(file, min_page, max_page, summary_prompt)
                     summaries[file] = summary
+                    # with cols[idx]:
                     st.markdown(f"**{file} (Pages {min_page}-{max_page}) Summary:**")
                     with st.expander("Click to view"):
                         st.write(summary)
             
+            # cols1, cols2 = st.columns(2)
             st.subheader("Observations and Insights")
+            # with cols1:
             st.markdown("**Key Observations**")
             insights = call_llm_api(insights_prompt, json.dumps(summaries))
             with st.expander("Click to view"):
                 st.write(insights)
+            # with cols2:
             st.markdown("**Web Search Results**")
             web_response, nexus_insights, faq = get_web_recommendations(summaries, insights)
             with st.expander("Click to view"):
                 st.write(web_response)
 
+            # cols3, cols4 = st.columns(2)
             st.subheader("Nexus Intelligence")
+            # with cols3:
             st.markdown("**Nexus Intelligent Insights**")
             with st.expander("Click to view"):
                 st.write(nexus_insights)
+            # with cols4:
             st.markdown("**Frequently Asked Questions**")
             with st.expander("Click to view"):
                 st.write(faq)
@@ -2888,9 +3196,11 @@ def main():
         unique_conversations.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
 
         for conv in unique_conversations:
+            # Use the conversation's timestamp as a unique identifier.
             conv_id = conv.get("timestamp")
             default_label = conv.get("label") or conv.get('messages', [{}])[0].get("content", "")[:50]
             
+            # Check if this conversation is in rename mode.
             if st.session_state.get("rename_mode") == conv_id:
                 new_label = st.sidebar.text_input("Rename Conversation", value=default_label, key=f"rename_input_{conv_id}")
                 if st.sidebar.button("Save", key=f"save_rename_{conv_id}"):
@@ -2898,6 +3208,7 @@ def main():
                     if user in st.session_state.chat_history:
                         for idx, stored_conv in enumerate(st.session_state.chat_history[user]):
                             if stored_conv.get("timestamp") == conv_id:
+                                # Only update the label
                                 st.session_state.chat_history[user][idx]["label"] = new_label
                                 break 
                     save_chat_history(st.session_state.chat_history)
@@ -2907,8 +3218,6 @@ def main():
             else:
                 col1, col2, col3, col4 = st.sidebar.columns([0.5, 0.2, 0.2, 0.1])
                 if col1.button(default_label, key=f"load_{conv_id}"):
-                    # Store the original conversation ID when loading
-                    st.session_state.original_conversation_id = conv_id
                     st.session_state.current_conversation = conv
                     st.session_state.messages = conv.get('messages', [])
                     st.session_state.selected_files = conv.get('files', [])
@@ -2926,11 +3235,13 @@ def main():
                     st.session_state["share_chat_mode"] = True
                     st.rerun()
 
+        # Insert the share-chat snippet below the conversation list:
         if st.session_state.get("share_chat_mode"):
             st.header("Share Chat Conversation")
             share_chat_with = st.multiselect("Select user(s) to share with", options=available_usernames)
             if st.button("Confirm Share Chat"):
                 chat_to_share = st.session_state["share_chat_conv"]
+                # For each target user, append a deep copy of the conversation
                 for user in share_chat_with:
                     if user in st.session_state.chat_history:
                         st.session_state.chat_history[user].append(copy.deepcopy(chat_to_share))
@@ -2938,11 +3249,13 @@ def main():
                         st.session_state.chat_history[user] = [copy.deepcopy(chat_to_share)]
                 save_chat_history(st.session_state.chat_history)
                 st.success("Chat conversation shared successfully!")
+                # Reset share mode variables
                 st.session_state["share_chat_mode"] = False
                 st.session_state.pop("share_chat_conv", None)
                 st.session_state.pop("share_chat_conv_id", None)
                 st.rerun()
 
+        # If a conversation is marked for deletion, confirm deletion.
         if "confirm_delete_conv" in st.session_state:
             chat_name = (
                 st.session_state["confirm_delete_conv"].get("label")
@@ -2957,7 +3270,7 @@ def main():
                         try:
                             st.session_state.chat_history[user].remove(st.session_state["confirm_delete_conv"])
                         except ValueError:
-                            pass
+                            pass  # Conversation already removed.
                         save_chat_history(st.session_state.chat_history)
                     del st.session_state["confirm_delete_conv"]
                     st.sidebar.success("Conversation deleted!")
@@ -2968,11 +3281,12 @@ def main():
                     st.sidebar.info("Deletion canceled.")
                     st.rerun()
 
-        # --- Display chat messages ---
+        # --- Display chat messages with share options ---
         for idx, message in enumerate(st.session_state.messages):
             with st.chat_message(message["role"]):
+                # Show role and time if available
                 msg_time = message.get("time", "")
-                role_title = message["role"].title()
+                role_title = message["role"].title()  # "User" / "Assistant"
                 st.markdown(f"**`[{role_title} @ {msg_time}]`**\n\n{message['content']}")
 
                 with st.expander("Show Copyable Text"):
@@ -3001,6 +3315,7 @@ def main():
                         key=f"email_new_{idx}"
                     )
                     if st.button("Share Message", key=f"share_button_{idx}"):
+                        # Combine WhatsApp numbers from selected contacts and new entries
                         whatsapp_numbers = [whatsapp_contacts[name] for name in selected_whatsapp]
                         if new_whatsapp_numbers:
                             new_nums = [num.strip() for num in new_whatsapp_numbers.split(",") if num.strip()]
@@ -3009,6 +3324,7 @@ def main():
                         for number in whatsapp_numbers:
                             whatsapp_results[number] = send_whatsapp_message(number, f" *{current_user}*  " + message["content"])
                         
+                        # Combine Email addresses from selected contacts and new entries
                         email_addresses = [email_contacts[name] for name in selected_email]
                         if new_email_addresses:
                             new_emails = [email.strip() for email in new_email_addresses.split(",") if email.strip()]
@@ -3020,14 +3336,15 @@ def main():
                         st.write("**WhatsApp Sharing Results:**", whatsapp_results)
                         st.write("**Email Sharing Results:**", email_results)
                 
+                # New expander for downloading the answer as a Word document
                 with st.expander("Download as Word Document"):
                     word_buffer = create_word_doc(message["content"])
                     st.download_button(
                         label="Download Answer",
                         data=word_buffer,
-                        file_name=f"Answer_{idx}.docx",
+                        file_name=f"Answer_{idx}.docx",  # Unique file name per message
                         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        key=f"download_button_{idx}"
+                        key=f"download_button_{idx}"  # Unique key per download button
                     )
     
                 if message["role"] == "assistant":
@@ -3039,51 +3356,63 @@ def main():
                             top_k_metadata = sources[0]
                             ws_query = sources[1]
 
+                            # Display file sources separately
                             for metadata in top_k_metadata:
                                 try:
                                     st.markdown(f"**Filename:** {metadata['filename']}, **Page:** {metadata['page']}")
-                                    st.code(metadata['text'], language="markdown")
+                                    st.code(metadata['text'], language="markdown")  # Use st.code for better formatting
                                 except:
-                                    st.code(json.dumps(metadata), language="markdown")
+                                    st.code(json.dumps(metadata), language="markdown")  # Use st.code for better formatting
 
+                            # Show Web Search Results separately
                             if ws_query:
                                 st.markdown("Web Search Results")
                                 st.code(ws_query)
 
+                            # Button for Source Mapping
                             if st.button("Show Source Mapping", key=f"source_mapping_{int(time.time() * 1000)}"):
                                 answer = message["content"]
                                 with st.spinner("Mapping Source..."):
                                     final_answer = final_format(top_k_metadata, answer, ws_query)
                                     st.write(final_answer)
 
-        # --- New User Input ---
+        # --- New User Input using text_area ---
         user_message = user_input()
         if user_message:
             ist_timezone = pytz.timezone("Asia/Kolkata")
             timestamp_now = datetime.now(ist_timezone).strftime("%Y-%m-%d %H:%M:%S")
 
+            # 1) Append the user's message to st.session_state.messages
             st.session_state.messages.append({
                 "role": "user",
                 "content": user_message,
                 "time": timestamp_now
             })
 
+            # Display the user message in chat
             with st.chat_message("user"):
                 st.markdown(user_message)
 
+            # [Run your retrieval code here: query_documents_with_page_range, etc.]
+
+            # Prepare the last few messages for context.
             last_messages = st.session_state.messages[-5:] if len(st.session_state.messages) >= 5 else st.session_state.messages
+
 
             with st.spinner("Searching documents..."):
                 st.markdown("**While you wait, Feel free to Refer to the Original Documents or Play a Relaxing Game**")
 
                 for file_key in st.session_state.selected_files:
+                    # Generate the pre-signed URL for each file
                     preview_url = get_presigned_url(file_key)
+                    # Create a clickable markdown link; clicking it will open the file in a new tab
                     st.markdown(f"[**{file_key}**]({preview_url})", unsafe_allow_html=True)
 
                 st.markdown("[Play Space Galaga](http://43.204.44.226:5500/space.html)")
                 st.markdown("[Play Snake Game](http://43.204.44.226:5500/snake.html)")
                 st.markdown("[Play Atari Breakout](http://43.204.44.226:5500/atari.html)")
                 st.markdown("[Play Endless Runner](http://43.204.44.226:5500/surfer.html)")
+
 
                 top_k_metadata, answer, ws_response = query_documents_with_page_range(
                     st.session_state.selected_files, 
@@ -3098,13 +3427,74 @@ def main():
                     eco_mode
                 )
 
-            st.session_state.sources.append({
-                "top_k_metadata": top_k_metadata,
-                "answer": answer,
-                "websearch_metadata": ws_response
-            })
+                # if "error" in answer.lower():
+                #     if "bedrock" in answer.lower() or "tavily" in answer.lower():
+                #             summary_prompt_dict = {
+                #                 "system_message": "You are an intelligent query refiner. Your job is to take a user's original query (which may contain poor grammar or informal language) along with the last 5 messages of the conversation and Summarise it into a Detailed Concise Message which explains what the user is asking for. Ensure you do not miss any details",
+                #                 "user_query": f"User Query: {user_message}\n\nLast 5 Messages: {last_messages}"
+                #             }
+                #             if eco_mode:
+                #                 prompt = call_novalite_api(summary_prompt_dict["system_message"], summary_prompt_dict["user_query"])
+                #             else:
+                #                 prompt = call_claude_api(summary_prompt_dict["system_message"], summary_prompt_dict["user_query"])
 
-            assistant_answer = answer
+                #             if "error" in prompt and "bedrock" in prompt:
+                #                 last_messages = st.session_state.messages[-2:] if len(st.session_state.messages) >= 2 else st.session_state.messages
+                #                 summary_prompt_dict = {
+                #                     "system_message": "You are an intelligent query refiner. Your job is to take a user's original query (which may contain poor grammar or informal language) along with the last 5 messages of the conversation and Summarise it into a Detailed Concise Message which explains what the user is asking for. Ensure you do not miss any details",
+                #                     "user_query": f"User Query: {user_message}\n\nLast 5 Messages: {last_messages}"
+                #                 }
+                #                 if eco_mode:
+                #                     prompt = call_novalite_api(summary_prompt_dict["system_message"], summary_prompt_dict["user_query"])
+                #                 else:
+                #                     prompt = call_claude_api(summary_prompt_dict["system_message"], summary_prompt_dict["user_query"])
+
+                #             top_k_metadata, answer, ws_response = query_documents_with_page_range(
+                #                 st.session_state.selected_files, 
+                #                 st.session_state.selected_page_ranges, 
+                #                 prompt,
+                #                 top_k,
+                #                 [],
+                #                 web_search,
+                #                 llm_model,
+                #                 draft_mode, 
+                #                 analyse_mode, 
+                #                 eco_mode
+                #             )
+
+                #             if "error" in answer and "bedrock" in answer:
+                #                 top_k_metadata, answer, ws_response = query_documents_with_page_range(
+                #                     st.session_state.selected_files, 
+                #                     st.session_state.selected_page_ranges, 
+                #                     prompt,
+                #                     top_k,
+                #                     [],
+                #                     web_search,
+                #                     llm_model,
+                #                     draft_mode, 
+                #                     True,
+                #                     eco_mode
+                #                 )
+                #                 if "error" in answer and "bedrock" in answer:
+                #                     top_k_metadata = []
+                #                     answer = """Looks Like you have Reached the Model Limits. Follow the following Steps:
+                #                     1. Try Starting a New Chat (Ensure to Add the same Files you were working on)
+                #                     2. If the Above Does not Work, Enable `Analyze Mode` on the side panel and try again
+                #                     3. If the Above two do not work, try switching the model or reduce the topK slider.
+                #                     """
+                #                     ws_response = ""
+
+                st.session_state.sources.append({
+                    "top_k_metadata": top_k_metadata,
+                    "answer": answer,
+                    "websearch_metadata": ws_response
+                })
+
+
+            ist_timezone = pytz.timezone("Asia/Kolkata")
+
+            # After you get the LLM's answer, you append the "assistant" message:
+            assistant_answer = answer  # from your retrieval
             current_time = datetime.now(ist_timezone).strftime("%Y-%m-%d %H:%M:%S")
             st.session_state.messages.append({
                 "role": "assistant",
@@ -3113,6 +3503,7 @@ def main():
                 "sources": [top_k_metadata, ws_response]
             })
 
+            # Show the assistant response in the UI
             with st.chat_message("assistant"):
                 st.markdown(assistant_answer)
 
@@ -3122,7 +3513,7 @@ def main():
 
             # Check if this is a continuation of an old conversation
             original_conv_id = st.session_state.get("original_conversation_id")
-            
+
             if original_conv_id:
                 # This is a continuation of an old conversation
                 # 1. Find the original conversation to get its label
@@ -3133,7 +3524,7 @@ def main():
                         original_conv = conv
                         original_label = conv.get("label", original_label)
                         break
-                
+            
                 # 2. Create a new conversation with the old label
                 new_conversation_id = str(uuid.uuid4())
                 new_conversation = {
@@ -3144,18 +3535,18 @@ def main():
                     "files": st.session_state.selected_files,
                     "page_ranges": st.session_state.selected_page_ranges
                 }
-                
+
                 # 3. Remove the old conversation
                 if original_conv:
                     try:
                         st.session_state.chat_history[user].remove(original_conv)
                     except ValueError:
                         pass
-                
-                # 4. Add the new conversation
+
+            # 4. Add the new conversation
                 st.session_state.chat_history[user].append(new_conversation)
-                
-                # 5. Update session state
+
+            # 5. Update session state
                 st.session_state.current_conversation_id = new_conversation_id
                 st.session_state.original_conversation_id = None  # Clear the original ID
                 
